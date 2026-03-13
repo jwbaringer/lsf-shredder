@@ -158,18 +158,8 @@ class Lsf extends Shredder
         'rsv_id_2',
         'job_description',
 
-        // Assuming this field will be zero.
-        'submit_ext_num',
-
-        'options3',
-        'bsub_w',
-
-        // Assuming this field will be zero.
-        'num_host_rusage',
-
-        'effective_res_req',
-        'total_provisional_time',
-        'run_time',
+        // LSF 10: everything after job_description is handled
+        // explicitly in parseLine() due to variable-length sections.
     );
 
     /**
@@ -329,38 +319,20 @@ class Lsf extends Shredder
 
         $job = array();
 
-        $fieldIdx = 0;
+        $fieldIdx     = 0;
         $fieldNameIdx = 0;
 
-        // Map numeric $fields array into a associative array.
-        while ($fieldIdx < $fieldCount) {
+        // --- Phase 1: consume all fixed+simple-variable fields in $fieldNames ---
+        while ($fieldNameIdx < static::$fieldCount) {
             $fieldName       = static::$fieldNames[$fieldNameIdx];
             $job[$fieldName] = $fields[$fieldIdx];
 
-            if ($fieldNameIdx == static::$fieldCount - 1) {
-                if ($fieldIdx + 1 < $fieldCount) {
-                    $extraFields = array_slice($fields, $fieldIdx + 1);
-                    $msg = 'Extra fields: ' .  json_encode($extraFields);
-                    $this->logger->debug($msg);
-
-                    foreach ($extraFields as $key => $value) {
-                        $job['unknown' . ($key + 1)] = $value;
-                    }
-                }
-
-                break;
-            }
-
-            // These entries indicate that the next "num" fields are
-            // all part of the next field
+            // num_asked_hosts and num_ex_hosts are followed by N host names.
             if (
                    $fieldName == 'num_asked_hosts'
                 || $fieldName == 'num_ex_hosts'
             ) {
-
-                // Determine the last index to include in the array.
-                $maxIdx = $fieldIdx + $fields[$fieldIdx];
-
+                $maxIdx     = $fieldIdx + (int)$fields[$fieldIdx];
                 $fieldArray = array();
 
                 while ($fieldIdx < $maxIdx) {
@@ -377,11 +349,128 @@ class Lsf extends Shredder
             $fieldNameIdx++;
         }
 
+        // --- Phase 2: LSF 10 variable-length sections (sequential parsing) ---
+
+        // submit_ext: count + N tag-value pairs
+        $submitExtCount    = (int)$fields[$fieldIdx++];
+        $submitExtFields   = array();
+        for ($i = 0; $i < $submitExtCount; $i++) {
+            $tag                     = $fields[$fieldIdx++];
+            $submitExtFields[$tag]   = $fields[$fieldIdx++];
+        }
+        $job['submit_ext'] = $submitExtFields;
+
+        // num_host_rusage + N entries (hostname, mem, swap, utime, stime)
+        $numHostRusage = (int)$fields[$fieldIdx++];
+        $hostRusages   = array();
+        for ($i = 0; $i < $numHostRusage; $i++) {
+            $hostRusages[] = array(
+                'hostname' => $fields[$fieldIdx++],
+                'mem'      => $fields[$fieldIdx++],
+                'swap'     => $fields[$fieldIdx++],
+                'utime'    => $fields[$fieldIdx++],
+                'stime'    => $fields[$fieldIdx++],
+            );
+        }
+        $job['host_rusage'] = $hostRusages;
+
+        // Fixed post-rusage fields (LSF 10 order)
+        foreach (array(
+            'options3', 'run_limit', 'avg_mem', 'effective_res_req',
+            'src_cluster', 'src_job_id', 'dst_cluster', 'dst_job_id',
+            'forward_time', 'flow_id', 'ac_job_wait_time',
+            'total_provision_time', 'outdir', 'run_time', 'subcwd',
+        ) as $name) {
+            $job[$name] = isset($fields[$fieldIdx]) ? $fields[$fieldIdx++] : null;
+        }
+
+        // num_network + N network allocs (network_id, num_window) + affinity
+        $numNetwork    = (int)$fields[$fieldIdx++];
+        $networks      = array();
+        for ($i = 0; $i < $numNetwork; $i++) {
+            $networks[] = array(
+                'network_id' => $fields[$fieldIdx++],
+                'num_window' => $fields[$fieldIdx++],
+            );
+        }
+        $job['networks'] = $networks;
+        $job['affinity'] = isset($fields[$fieldIdx]) ? $fields[$fieldIdx++] : null;
+
+        // Performance counters
+        foreach (array('serial_job_energy', 'cpi', 'gips', 'gbs', 'gflops') as $name) {
+            $job[$name] = isset($fields[$fieldIdx]) ? $fields[$fieldIdx++] : null;
+        }
+
+        // num_alloc_slots + N slot host names
+        $numAllocSlots    = (int)$fields[$fieldIdx++];
+        $allocSlots       = array();
+        for ($i = 0; $i < $numAllocSlots; $i++) {
+            $allocSlots[] = $fields[$fieldIdx++];
+        }
+        $job['alloc_slots'] = $allocSlots;
+
+        // Pending time, index ranges, requeue
+        $job['ineligible_pend_time'] = isset($fields[$fieldIdx]) ? $fields[$fieldIdx++] : null;
+        $indexRangeCnt = (int)$fields[$fieldIdx++];
+        $ranges        = array();
+        for ($i = 0; $i < $indexRangeCnt; $i++) {
+            $ranges[] = array(
+                'start' => $fields[$fieldIdx++],
+                'end'   => $fields[$fieldIdx++],
+                'step'  => $fields[$fieldIdx++],
+            );
+        }
+        $job['index_ranges']  = $ranges;
+        $job['requeue_time']  = isset($fields[$fieldIdx]) ? $fields[$fieldIdx++] : null;
+
+        // GPU rusage: count + per-host entries (hostname, numKVP, key-value pairs)
+        $numGpuRusages = (int)$fields[$fieldIdx++];
+        $gpuRusages    = array();
+        for ($i = 0; $i < $numGpuRusages; $i++) {
+            $hostname = $fields[$fieldIdx++];
+            $numKvp   = (int)$fields[$fieldIdx++];
+            $kvp      = array();
+            for ($j = 0; $j < $numKvp; $j++) {
+                $k      = $fields[$fieldIdx++];
+                $kvp[$k] = $fields[$fieldIdx++];
+            }
+            $gpuRusages[] = array('hostname' => $hostname, 'kvp' => $kvp);
+        }
+        $job['gpu_rusages'] = $gpuRusages;
+
+        // Storage info
+        $storageInfoC  = (int)$fields[$fieldIdx++];
+        $storageInfo   = array();
+        for ($i = 0; $i < $storageInfoC; $i++) {
+            $storageInfo[] = $fields[$fieldIdx++];
+        }
+        $job['storage_info'] = $storageInfo;
+
+        // finishKVP: count + N key-value pairs
+        $finishKvpCount = (int)$fields[$fieldIdx++];
+        $finishKvp      = array();
+        for ($i = 0; $i < $finishKvpCount; $i++) {
+            $k           = $fields[$fieldIdx++];
+            $finishKvp[$k] = $fields[$fieldIdx++];
+        }
+        $job['finish_kvp'] = $finishKvp;
+
+        // Scheduling overhead (final field)
+        $job['scheduling_overhead'] = isset($fields[$fieldIdx]) ? $fields[$fieldIdx++] : null;
+
+        // Warn if unexpected fields remain
+        if ($fieldIdx < $fieldCount) {
+            $extra = array_slice($fields, $fieldIdx);
+            $this->logger->debug('Unexpected trailing fields: ' . json_encode($extra));
+        }
+
+        // --- Phase 3: post-processing ---
+
         // Remove slots from formatted host name.
         // e.g. "16*exampleHost" is replaced with "exampleHost".
         $job['exec_hosts'] = array_map(
             function ($host) {
-                if (preg_match('/^(?:\d+\\*)?(.*)$/', $host, $matches)) {
+                if (preg_match('/^(?:\d+\*)?(.*)$/', $host, $matches)) {
                     return $matches[1];
                 } else {
                     return $host;
